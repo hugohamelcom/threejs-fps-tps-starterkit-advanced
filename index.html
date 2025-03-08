@@ -1,0 +1,1334 @@
+<!DOCTYPE html>
+<html lang="en">
+	<head>
+		<title>three.js - misc - octree collisions</title>
+		<meta charset=utf-8 />
+		<meta name="viewport" content="width=device-width, user-scalable=no, minimum-scale=1.0, maximum-scale=1.0">
+		<link type="text/css" rel="stylesheet" href="assets/css/main.css">
+	</head>
+	<body>
+		<div id="info">
+			MOUSE to look around and to throw balls<br/>
+			WASD to move and SPACE to jump<br/>
+			SHIFT to sprint, C to toggle camera view
+		</div>
+		<div id="container"></div>
+
+		<script type="importmap">
+			{
+				"imports": {
+					"three": "https://cdn.jsdelivr.net/npm/three@0.174.0/build/three.module.js",
+					"three/addons/": "https://cdn.jsdelivr.net/npm/three@0.174.0/examples/jsm/"
+				}
+			}
+		</script>
+
+		<script type="module">
+
+			import * as THREE from 'three';
+
+			import Stats from 'three/addons/libs/stats.module.js';
+
+			import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+			import { Octree } from 'three/addons/math/Octree.js';
+			import { OctreeHelper } from 'three/addons/helpers/OctreeHelper.js';
+
+			import { Capsule } from 'three/addons/math/Capsule.js';
+
+			import { GUI } from 'three/addons/libs/lil-gui.module.min.js';
+
+			import { Sky } from 'three/addons/objects/Sky.js';
+
+			const clock = new THREE.Clock();
+
+			const scene = new THREE.Scene();
+			scene.background = new THREE.Color( 0x88ccee );
+			scene.fog = new THREE.Fog( 0x88ccee, 0, 50 );
+
+			const camera = new THREE.PerspectiveCamera( 70, window.innerWidth / window.innerHeight, 0.1, 1000 );
+			camera.rotation.order = 'YXZ';
+
+			const fillLight1 = new THREE.HemisphereLight( 0x8dc1de, 0x00668d, 1.5 );
+			fillLight1.position.set( 2, 1, 1 );
+			scene.add( fillLight1 );
+
+			const directionalLight = new THREE.DirectionalLight(0xfff4e6, 2.5); // Warm beige color for sun
+			directionalLight.position.set(-5, 25, -1);
+			directionalLight.castShadow = true;
+			directionalLight.shadow.camera.near = 0.01;
+			directionalLight.shadow.camera.far = 500;
+			directionalLight.shadow.camera.right = 30;
+			directionalLight.shadow.camera.left = -30;
+			directionalLight.shadow.camera.top = 30;
+			directionalLight.shadow.camera.bottom = -30;
+			directionalLight.shadow.mapSize.width = 1024;
+			directionalLight.shadow.mapSize.height = 1024;
+			directionalLight.shadow.radius = 4;
+			directionalLight.shadow.bias = -0.00006;
+			scene.add(directionalLight);
+
+			// Add moon light (cool blue color)
+			const moonLight = new THREE.DirectionalLight(0xadd8e6, 0.2); // Light blue color for moon
+			moonLight.position.set(-5, 25, -1);
+			moonLight.castShadow = true;
+			moonLight.shadow.camera.near = 0.01;
+			moonLight.shadow.camera.far = 500;
+			moonLight.shadow.camera.right = 30;
+			moonLight.shadow.camera.left = -30;
+			moonLight.shadow.camera.top = 30;
+			moonLight.shadow.camera.bottom = -30;
+			moonLight.shadow.mapSize.width = 1024;
+			moonLight.shadow.mapSize.height = 1024;
+			moonLight.shadow.radius = 4;
+			moonLight.shadow.bias = -0.00006;
+			scene.add(moonLight);
+
+			// Add sky with day/night cycle
+			const sky = new Sky();
+			sky.scale.setScalar(450000);
+			scene.add(sky);
+
+			// Add moon object - visible during night
+			const moonGeometry = new THREE.SphereGeometry(5000, 16, 16);
+			const moonMaterial = new THREE.MeshBasicMaterial({
+				color: 0xffffff,
+				transparent: true,
+				opacity: 0
+			});
+			const moon = new THREE.Mesh(moonGeometry, moonMaterial);
+			scene.add(moon);
+
+			// Sun position vector
+			const sunPosition = new THREE.Vector3();
+
+			// Stars for night sky
+			const starsGroup = new THREE.Group();
+			scene.add(starsGroup);
+
+			// Create stars
+			function createStars() {
+				const starsGeometry = new THREE.BufferGeometry();
+				const starsMaterial = new THREE.PointsMaterial({
+					color: 0xffffff,
+					size: 1,
+					transparent: true,
+					opacity: 0,
+					sizeAttenuation: false
+				});
+
+				const starsVertices = [];
+				for (let i = 0; i < 5000; i++) {
+					const x = THREE.MathUtils.randFloatSpread(2000);
+					const y = THREE.MathUtils.randFloatSpread(2000);
+					const z = THREE.MathUtils.randFloatSpread(2000);
+					
+					// Keep stars above horizon
+					if (y > 0) {
+						starsVertices.push(x, y, z);
+					}
+				}
+
+				starsGeometry.setAttribute('position', new THREE.Float32BufferAttribute(starsVertices, 3));
+				const stars = new THREE.Points(starsGeometry, starsMaterial);
+				starsGroup.add(stars);
+				
+				return stars;
+			}
+
+			const stars = createStars();
+
+			// Day/night cycle parameters
+			const dayCycle = {
+				// Full cycle duration in seconds
+				cycleDuration: 240, // 4 minutes for full day/night cycle
+				time: 240 * 0.125, // Start at midday (12.5% of cycle)
+				// Sky parameters for different times of day
+				skyStates: {
+					// Day phases
+					sunrise: { elevation: 0, azimuth: -90, rayleigh: 0.2, exposure: 0.9, turbidity: 10, mieCoefficient: 0.005, mieDirectionalG: 0.7 },
+					midday: { elevation: 90, azimuth: 0, rayleigh: 0.3, exposure: 1.0, turbidity: 10, mieCoefficient: 0.005, mieDirectionalG: 0.7 },
+					sunset: { elevation: 0, azimuth: 90, rayleigh: 2, exposure: 0.8, turbidity: 10, mieCoefficient: 0.005, mieDirectionalG: 0.7 },
+					
+					// Day to night transition
+					reposition_day_night_start: { elevation: 0, azimuth: 90, rayleigh: 1, exposure: 0.05, turbidity: 0, mieCoefficient: 0, mieDirectionalG: 0 },
+					reposition_day_night_middle: { elevation: 0, azimuth: -90, rayleigh: 1, exposure: 0.05, turbidity: 0, mieCoefficient: 0, mieDirectionalG: 0 },
+					reposition_day_night_end: { elevation: 0, azimuth: -90, rayleigh: 0.3, exposure: 0.1, turbidity: 10, mieCoefficient: 0.005, mieDirectionalG: 0.7 },
+					
+					// Night phases
+					moonrise: { elevation: 0, azimuth: -90, rayleigh: 0.3, exposure: 0.1, turbidity: 10, mieCoefficient: 0.005, mieDirectionalG: 0.7 },
+					midnight: { elevation: 90, azimuth: 0, rayleigh: 0.05, exposure: 0.1, turbidity: 10, mieCoefficient: 0.005, mieDirectionalG: 0.7 },
+					moonset: { elevation: 0, azimuth: 90, rayleigh: 0.1, exposure: 0.5, turbidity: 10, mieCoefficient: 0.005, mieDirectionalG: 0.7 },
+					
+					// Night to day transition
+					reposition_night_day_start: { elevation: 0, azimuth: 90, rayleigh: 1, exposure: 0.05, turbidity: 0, mieCoefficient: 0, mieDirectionalG: 0 },
+					reposition_night_day_middle: { elevation: 0, azimuth: -90, rayleigh: 1, exposure: 0.05, turbidity: 0, mieCoefficient: 0, mieDirectionalG: 0 },
+					reposition_night_day_end: { elevation: 0, azimuth: -90, rayleigh: 0.2, exposure: 0.9, turbidity: 10, mieCoefficient: 0.005, mieDirectionalG: 0.7 }
+				},
+				// Current sky parameters
+				current: { elevation: 0, azimuth: -90, rayleigh: 0.2, exposure: 0.9, turbidity: 10, mieCoefficient: 0.005, mieDirectionalG: 0.7 },
+				
+				// Phase transitions - fraction of cycle when each phase starts
+				phases: {
+					// Day phases
+					sunrise: 0,           // 0%
+					midday: 0.4,          // 40% (middle of day)
+					sunset: 0.8,          // 80% (end of day)
+					
+					// Day to night transition (3% of cycle)
+					reposition_day_night_start: 0.81,   // 81% - Change visual parameters
+					reposition_day_night_middle: 0.82,  // 82% - Move azimuth position
+					reposition_day_night_end: 0.83,     // 83% - Prepare for night visuals
+					
+					// Night phases
+					moonrise: 0.84,       // 84% (start of night)
+					midnight: 0.90,       // 90% (middle of night)
+					moonset: 0.96,        // 96% (end of night)
+					
+					// Night to day transition (3% of cycle)
+					reposition_night_day_start: 0.97,   // 97% - Change visual parameters
+					reposition_night_day_middle: 0.98,  // 98% - Move azimuth position
+					reposition_night_day_end: 0.99      // 99% - Prepare for day visuals
+				},
+
+				// For controlling object visibility
+				sunIntensity: 2.5,
+				moonIntensity: 0,
+				starsOpacity: 0
+			};
+
+			// Initialize sky uniforms
+			function updateSkyUniforms() {
+				const uniforms = sky.material.uniforms;
+				uniforms['turbidity'].value = dayCycle.current.turbidity;
+				uniforms['rayleigh'].value = dayCycle.current.rayleigh;
+				uniforms['mieCoefficient'].value = dayCycle.current.mieCoefficient;
+				uniforms['mieDirectionalG'].value = dayCycle.current.mieDirectionalG;
+
+				const phi = THREE.MathUtils.degToRad(90 - dayCycle.current.elevation);
+				const theta = THREE.MathUtils.degToRad(dayCycle.current.azimuth);
+
+				sunPosition.setFromSphericalCoords(1, phi, theta);
+				uniforms['sunPosition'].value.copy(sunPosition);
+
+				// Position moon opposite to sun (180 degrees rotated)
+				const moonPhi = THREE.MathUtils.degToRad(90 - dayCycle.current.elevation);
+				const moonTheta = THREE.MathUtils.degToRad(dayCycle.current.azimuth + 180);
+				
+				// Position moon at a distance
+				moon.position.setFromSphericalCoords(400000, moonPhi, moonTheta);
+
+				// Update renderer exposure
+				renderer.toneMappingExposure = dayCycle.current.exposure;
+
+				// Update light intensities based on cycle
+				directionalLight.intensity = dayCycle.sunIntensity;
+				moonLight.intensity = dayCycle.moonIntensity;
+				
+				// Update shadow-casting light positions to follow sun/moon
+				// Determine if we're in a repositioning phase
+				const progress = dayCycle.time / dayCycle.cycleDuration;
+				const isRepositioning = (progress >= dayCycle.phases.reposition_day_night_start && progress <= dayCycle.phases.reposition_day_night_end) || 
+									   (progress >= dayCycle.phases.reposition_night_day_start && progress <= dayCycle.phases.reposition_night_day_end);
+				
+				if (!isRepositioning) {
+					// Set sun light position based on actual sun direction
+					// Keep height (y) value high enough for good shadow mapping
+					directionalLight.position.set(
+						sunPosition.x * 30,
+						Math.max(25, sunPosition.y * 30), // Keep minimum height
+						sunPosition.z * 30
+					);
+					
+					// Set moon light position based on moon direction
+					moonLight.position.set(
+						-sunPosition.x * 30, // Opposite to sun
+						Math.max(25, -sunPosition.y * 30), // Keep minimum height
+						-sunPosition.z * 30
+					);
+				}
+				
+				// Update stars opacity
+				stars.material.opacity = dayCycle.starsOpacity;
+				moonMaterial.opacity = dayCycle.moonIntensity / 0.2 * 0.8; // Scale moon opacity with moon light intensity
+
+				// Update light colors based on cycle
+				if (dayCycle.sunIntensity > 0) {
+					// Daytime - warm sun color
+					const sunColor = new THREE.Color(0xfff4e6); // Base warm beige
+					sunColor.lerp(new THREE.Color(0xffd700), Math.min(1, dayCycle.sunIntensity / 2.5)); // Add gold at peak intensity
+					directionalLight.color.copy(sunColor);
+				} else {
+					// Nighttime - cool moon color
+					const moonColor = new THREE.Color(0xadd8e6); // Base light blue
+					moonColor.lerp(new THREE.Color(0xffffff), Math.min(1, dayCycle.moonIntensity / 0.2)); // Add white at peak intensity
+					moonLight.color.copy(moonColor);
+				}
+			}
+
+			// Linear interpolation function
+			function lerp(a, b, t) {
+				return a + (b - a) * t;
+			}
+
+			// Easing function for smooth transitions
+			function easeInOutCubic(t) {
+				return t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+			}
+
+			// Update sky based on current cycle time
+			function updateDayCycle(deltaTime) {
+				// Update cycle time
+				dayCycle.time += deltaTime;
+				if (dayCycle.time > dayCycle.cycleDuration) {
+					dayCycle.time -= dayCycle.cycleDuration;
+				}
+				
+				// Calculate current cycle progress (0-1)
+				const progress = dayCycle.time / dayCycle.cycleDuration;
+				
+				// Determine current and next phase
+				let currentPhase, nextPhase, phaseProgress;
+				
+				if (progress < dayCycle.phases.midday) {
+					// Sunrise to midday
+					currentPhase = 'sunrise';
+					nextPhase = 'midday';
+					phaseProgress = (progress - dayCycle.phases.sunrise) / (dayCycle.phases.midday - dayCycle.phases.sunrise);
+				} else if (progress < dayCycle.phases.sunset) {
+					// Midday to sunset
+					currentPhase = 'midday';
+					nextPhase = 'sunset';
+					phaseProgress = (progress - dayCycle.phases.midday) / (dayCycle.phases.sunset - dayCycle.phases.midday);
+				} else if (progress < dayCycle.phases.reposition_day_night_start) {
+					// Sunset to day-night repositioning start
+					currentPhase = 'sunset';
+					nextPhase = 'reposition_day_night_start';
+					phaseProgress = (progress - dayCycle.phases.sunset) / (dayCycle.phases.reposition_day_night_start - dayCycle.phases.sunset);
+				} else if (progress < dayCycle.phases.reposition_day_night_middle) {
+					// Day-night repositioning start to middle
+					currentPhase = 'reposition_day_night_start';
+					nextPhase = 'reposition_day_night_middle';
+					phaseProgress = (progress - dayCycle.phases.reposition_day_night_start) / (dayCycle.phases.reposition_day_night_middle - dayCycle.phases.reposition_day_night_start);
+				} else if (progress < dayCycle.phases.reposition_day_night_end) {
+					// Day-night repositioning middle to end
+					currentPhase = 'reposition_day_night_middle';
+					nextPhase = 'reposition_day_night_end';
+					phaseProgress = (progress - dayCycle.phases.reposition_day_night_middle) / (dayCycle.phases.reposition_day_night_end - dayCycle.phases.reposition_day_night_middle);
+				} else if (progress < dayCycle.phases.moonrise) {
+					// Day-night repositioning end to moonrise
+					currentPhase = 'reposition_day_night_end';
+					nextPhase = 'moonrise';
+					phaseProgress = (progress - dayCycle.phases.reposition_day_night_end) / (dayCycle.phases.moonrise - dayCycle.phases.reposition_day_night_end);
+				} else if (progress < dayCycle.phases.midnight) {
+					// Moonrise to midnight
+					currentPhase = 'moonrise';
+					nextPhase = 'midnight';
+					phaseProgress = (progress - dayCycle.phases.moonrise) / (dayCycle.phases.midnight - dayCycle.phases.moonrise);
+				} else if (progress < dayCycle.phases.moonset) {
+					// Midnight to moonset
+					currentPhase = 'midnight';
+					nextPhase = 'moonset';
+					phaseProgress = (progress - dayCycle.phases.midnight) / (dayCycle.phases.moonset - dayCycle.phases.midnight);
+				} else if (progress < dayCycle.phases.reposition_night_day_start) {
+					// Moonset to night-day repositioning start
+					currentPhase = 'moonset';
+					nextPhase = 'reposition_night_day_start';
+					phaseProgress = (progress - dayCycle.phases.moonset) / (dayCycle.phases.reposition_night_day_start - dayCycle.phases.moonset);
+				} else if (progress < dayCycle.phases.reposition_night_day_middle) {
+					// Night-day repositioning start to middle
+					currentPhase = 'reposition_night_day_start';
+					nextPhase = 'reposition_night_day_middle';
+					phaseProgress = (progress - dayCycle.phases.reposition_night_day_start) / (dayCycle.phases.reposition_night_day_middle - dayCycle.phases.reposition_night_day_start);
+				} else if (progress < dayCycle.phases.reposition_night_day_end) {
+					// Night-day repositioning middle to end
+					currentPhase = 'reposition_night_day_middle';
+					nextPhase = 'reposition_night_day_end';
+					phaseProgress = (progress - dayCycle.phases.reposition_night_day_middle) / (dayCycle.phases.reposition_night_day_end - dayCycle.phases.reposition_night_day_middle);
+				} else {
+					// Night-day repositioning end to sunrise
+					currentPhase = 'reposition_night_day_end';
+					nextPhase = 'sunrise';
+					phaseProgress = (progress - dayCycle.phases.reposition_night_day_end) / (1 - dayCycle.phases.reposition_night_day_end);
+				}
+				
+				// Apply easing to get smoother transitions
+				phaseProgress = easeInOutCubic(phaseProgress);
+				
+				// Interpolate between current and next phase
+				const currentState = dayCycle.skyStates[currentPhase];
+				const nextState = dayCycle.skyStates[nextPhase];
+				
+				// Update current parameters
+				dayCycle.current.elevation = lerp(currentState.elevation, nextState.elevation, phaseProgress);
+				dayCycle.current.azimuth = lerp(currentState.azimuth, nextState.azimuth, phaseProgress);
+				dayCycle.current.rayleigh = lerp(currentState.rayleigh, nextState.rayleigh, phaseProgress);
+				dayCycle.current.exposure = lerp(currentState.exposure, nextState.exposure, phaseProgress);
+				dayCycle.current.turbidity = lerp(currentState.turbidity, nextState.turbidity, phaseProgress);
+				dayCycle.current.mieCoefficient = lerp(currentState.mieCoefficient, nextState.mieCoefficient, phaseProgress);
+				dayCycle.current.mieDirectionalG = lerp(currentState.mieDirectionalG, nextState.mieDirectionalG, phaseProgress);
+				
+				// Update light intensities
+				if (progress < dayCycle.phases.sunset) {
+					// Day time - full sun
+					dayCycle.sunIntensity = 2.5;
+					dayCycle.moonIntensity = 0;
+					dayCycle.starsOpacity = 0;
+				} else if (progress < dayCycle.phases.reposition_day_night_start) {
+					// Sunset to reposition_day_night_start transition
+					const transitionProgress = (progress - dayCycle.phases.sunset) / (dayCycle.phases.reposition_day_night_start - dayCycle.phases.sunset);
+					dayCycle.sunIntensity = lerp(2.5, 0, transitionProgress);
+					dayCycle.moonIntensity = 0;
+					dayCycle.starsOpacity = 0;
+				} else if (progress < dayCycle.phases.reposition_day_night_end) {
+					// During day-night repositioning - complete darkness
+					dayCycle.sunIntensity = 0;
+					dayCycle.moonIntensity = 0;
+					dayCycle.starsOpacity = 0;
+				} else if (progress < dayCycle.phases.moonrise) {
+					// reposition_day_night_end to moonrise - moon begins to appear
+					const transitionProgress = (progress - dayCycle.phases.reposition_day_night_end) / (dayCycle.phases.moonrise - dayCycle.phases.reposition_day_night_end);
+					dayCycle.sunIntensity = 0;
+					dayCycle.moonIntensity = lerp(0, 0.2, transitionProgress);
+					dayCycle.starsOpacity = lerp(0, 0.8, transitionProgress);
+				} else if (progress < dayCycle.phases.moonset) {
+					// Night time - full moon and stars
+					dayCycle.sunIntensity = 0;
+					dayCycle.moonIntensity = 0.2;
+					dayCycle.starsOpacity = 0.8;
+				} else if (progress < dayCycle.phases.reposition_night_day_start) {
+					// Moonset to reposition_night_day_start
+					const transitionProgress = (progress - dayCycle.phases.moonset) / (dayCycle.phases.reposition_night_day_start - dayCycle.phases.moonset);
+					dayCycle.sunIntensity = 0;
+					dayCycle.moonIntensity = lerp(0.2, 0, transitionProgress);
+					dayCycle.starsOpacity = lerp(0.8, 0.3, transitionProgress);
+				} else if (progress < dayCycle.phases.reposition_night_day_end) {
+					// During night-day repositioning - complete darkness with faint stars
+					dayCycle.sunIntensity = 0;
+					dayCycle.moonIntensity = 0;
+					dayCycle.starsOpacity = 0.3;
+				} else {
+					// reposition_night_day_end to sunrise - sun begins to appear
+					const transitionProgress = (progress - dayCycle.phases.reposition_night_day_end) / (1 - dayCycle.phases.reposition_night_day_end);
+					dayCycle.sunIntensity = lerp(0, 2.5, transitionProgress);
+					dayCycle.moonIntensity = 0;
+					dayCycle.starsOpacity = lerp(0.3, 0, transitionProgress);
+				}
+				
+				// Update sky and related objects
+				updateSkyUniforms();
+			}
+
+			const container = document.getElementById( 'container' );
+
+			const renderer = new THREE.WebGLRenderer( { antialias: true } );
+			renderer.setPixelRatio( window.devicePixelRatio );
+			renderer.setSize( window.innerWidth, window.innerHeight );
+			renderer.setAnimationLoop( animate );
+			renderer.shadowMap.enabled = true;
+			renderer.shadowMap.type = THREE.VSMShadowMap;
+			renderer.toneMapping = THREE.ACESFilmicToneMapping;
+			container.appendChild( renderer.domElement );
+
+			const stats = new Stats();
+			stats.domElement.style.position = 'absolute';
+			stats.domElement.style.top = '0px';
+			container.appendChild( stats.domElement );
+
+			const GRAVITY = 30;
+
+			const NUM_SPHERES = 100;
+			const SPHERE_RADIUS = 0.2;
+
+			const STEPS_PER_FRAME = 5;
+
+			// Player model variables
+			let playerModel = null;
+			const playerModelScale = 0.7; // Scale to match capsule size
+			const playerModelOffset = new THREE.Vector3(0, -0.66, 0); // Adjusted offset to better match ground level
+
+			// Animation variables
+			let playerMixer = null;
+			let playerAnimations = {};
+			let currentAnimation = 'idle';
+			let fadeTime = 0.2; // Time to crossfade between animations
+			let playerClock = new THREE.Clock();
+			const animationWeights = {
+				idle: { weight: 1 },
+				walk: { weight: 0 },
+				walkBack: { weight: 0 },
+				run: { weight: 0 }
+			};
+
+			// Additive animation variables
+			let additiveAnimations = {};
+			let isJumping = false;
+			let jumpAnimationWeight = 0;
+			let jumpAnimation = null;
+			const JUMP_ANIMATION_FADE_TIME = 0.2; // Time to fade in/out jump animation
+
+			// Jump animation state tracking
+			let jumpState = 'none'; // 'none', 'preparing', 'rising', 'falling', 'landing'
+			let jumpStartTime = 0; // Time when jump preparation begins
+			const JUMP_PREPARE_TIME = 0.2; // Time to prepare for jump (seconds)
+			const JUMP_RECOVERY_TIME = 0.3; // Time to recover after landing (seconds)
+
+			// Load player model (Xbot)
+			const playerLoader = new GLTFLoader();
+			playerLoader.load('https://threejs.org/examples/models/gltf/Xbot.glb', function(gltf) {
+				playerModel = gltf.scene;
+				playerModel.scale.setScalar(playerModelScale);
+				playerModel.traverse(function(object) {
+					if (object.isMesh) {
+						object.castShadow = true;
+						object.receiveShadow = true;
+					}
+				});
+				playerModel.visible = false; // Initially hidden in first-person view
+				scene.add(playerModel);
+				
+				// Set up animations
+				playerMixer = new THREE.AnimationMixer(playerModel);
+				
+				// Get animations from the model
+				const animations = gltf.animations;
+				
+				// Find and set up the animations we need
+				animations.forEach(clip => {
+					// Map animation names to our desired states
+					let animName = clip.name.toLowerCase();
+					
+					if (animName.includes('idle')) {
+						playerAnimations.idle = playerMixer.clipAction(clip);
+					} else if (animName.includes('walk')) {
+						playerAnimations.walk = playerMixer.clipAction(clip);
+						
+						// Create backward walk by cloning the walk animation and reversing it
+						const walkBackClip = clip.clone();
+						walkBackClip.name = 'walkBack';
+						playerAnimations.walkBack = playerMixer.clipAction(walkBackClip);
+						playerAnimations.walkBack.timeScale = -1; // Reverse the animation
+						
+					} else if (animName.includes('run')) {
+						playerAnimations.run = playerMixer.clipAction(clip);
+					} else if (animName.includes('sneak')) {
+						// Found sneak animation - we'll use this for jumping
+						// First, clone it and make it suitable for additive animation
+						let sneakClip = clip.clone();
+						sneakClip.name = 'jump_pose';
+						
+						// Make the clip additive and remove the reference frame
+						THREE.AnimationUtils.makeClipAdditive(sneakClip);
+						
+						// For pose animations, just use a specific frame
+						sneakClip = THREE.AnimationUtils.subclip(sneakClip, sneakClip.name, 2, 3, 30);
+						
+						// Create the additive action
+						jumpAnimation = playerMixer.clipAction(sneakClip);
+						jumpAnimation.setEffectiveWeight(0); // Start with zero weight
+						jumpAnimation.play(); // Always playing but with zero weight initially
+						
+						additiveAnimations.jump_pose = jumpAnimation;
+					}
+				});
+				
+				// If we couldn't find the exact named animations, use defaults
+				if (!playerAnimations.idle && animations.length > 0) {
+					playerAnimations.idle = playerMixer.clipAction(animations[0]); // Usually first anim is idle
+				}
+				
+				if (!playerAnimations.walk && animations.length > 1) {
+					playerAnimations.walk = playerMixer.clipAction(animations[1]); // Often second anim is walk
+					
+					// Create backward walk from the default walk animation
+					if (playerAnimations.walk) {
+						const walkBackClip = animations[1].clone();
+						walkBackClip.name = 'walkBack';
+						playerAnimations.walkBack = playerMixer.clipAction(walkBackClip);
+						playerAnimations.walkBack.timeScale = -1; // Reverse the animation
+					}
+				}
+				
+				if (!playerAnimations.run && animations.length > 2) {
+					playerAnimations.run = playerMixer.clipAction(animations[2]); // Third might be run
+				}
+				
+				// If jump animation wasn't found, try to find another suitable animation or create a placeholder
+				if (!jumpAnimation && animations.length > 0) {
+					// Try to find any animation that could work for jumping (like a wave or arm raise)
+					let foundSuitableAnim = false;
+					
+					for (let i = 0; i < animations.length && !foundSuitableAnim; i++) {
+						const clipName = animations[i].name.toLowerCase();
+						if (clipName.includes('wave') || clipName.includes('arm') || clipName.includes('raise')) {
+							let jumpClip = animations[i].clone();
+							jumpClip.name = 'jump_pose';
+							
+							// Make it additive
+							THREE.AnimationUtils.makeClipAdditive(jumpClip);
+							jumpClip = THREE.AnimationUtils.subclip(jumpClip, jumpClip.name, 2, 3, 30);
+							
+							jumpAnimation = playerMixer.clipAction(jumpClip);
+							jumpAnimation.setEffectiveWeight(0);
+							jumpAnimation.play();
+							
+							additiveAnimations.jump_pose = jumpAnimation;
+							foundSuitableAnim = true;
+						}
+					}
+					
+					// If still no suitable animation, use the idle as a fallback (not ideal but prevents errors)
+					if (!foundSuitableAnim && playerAnimations.idle) {
+						console.warn("No suitable jump animation found - using placeholder");
+						let jumpClip = animations[0].clone(); // Use idle as base
+						jumpClip.name = 'jump_pose';
+						
+						THREE.AnimationUtils.makeClipAdditive(jumpClip);
+						jumpClip = THREE.AnimationUtils.subclip(jumpClip, jumpClip.name, 2, 3, 30);
+						
+						jumpAnimation = playerMixer.clipAction(jumpClip);
+						jumpAnimation.setEffectiveWeight(0);
+						jumpAnimation.play();
+						
+						additiveAnimations.jump_pose = jumpAnimation;
+					}
+				}
+				
+				// Initialize animations
+				if (playerAnimations.idle) {
+					playerAnimations.idle.play();
+					playerAnimations.idle.setEffectiveWeight(1);
+				}
+				
+				if (playerAnimations.walk) {
+					playerAnimations.walk.play();
+					playerAnimations.walk.setEffectiveWeight(0);
+				}
+				
+				if (playerAnimations.walkBack) {
+					playerAnimations.walkBack.play();
+					playerAnimations.walkBack.setEffectiveWeight(0);
+				}
+				
+				if (playerAnimations.run) {
+					playerAnimations.run.play();
+					playerAnimations.run.setEffectiveWeight(0);
+				}
+			});
+
+			const sphereGeometry = new THREE.IcosahedronGeometry( SPHERE_RADIUS, 5 );
+			const sphereMaterial = new THREE.MeshLambertMaterial( { color: 0xdede8d } );
+
+			const spheres = [];
+			let sphereIdx = 0;
+
+			for ( let i = 0; i < NUM_SPHERES; i ++ ) {
+
+				const sphere = new THREE.Mesh( sphereGeometry, sphereMaterial );
+				sphere.castShadow = true;
+				sphere.receiveShadow = true;
+
+				scene.add( sphere );
+
+				spheres.push( {
+					mesh: sphere,
+					collider: new THREE.Sphere( new THREE.Vector3( 0, - 100, 0 ), SPHERE_RADIUS ),
+					velocity: new THREE.Vector3()
+				} );
+
+			}
+
+			const worldOctree = new Octree();
+
+			const playerCollider = new Capsule( new THREE.Vector3( 0, 0.35, 0 ), new THREE.Vector3( 0, 1, 0 ), 0.35 );
+
+			const playerVelocity = new THREE.Vector3();
+			const playerDirection = new THREE.Vector3();
+
+			let playerOnFloor = false;
+			let mouseTime = 0;
+			// Jump cooldown variables
+			let jumpCooldown = 0;
+			const JUMP_COOLDOWN_TIME = 0.25; // Cooldown in seconds
+
+			// Camera view mode (true = third person, false = first person)
+			let thirdPersonView = false;
+			// Third person camera offset offset from player in third-person view (x, y, z)
+			// x: horizontal offset
+			// y: vertical offset
+			// z: distance from player
+			const cameraOffset = new THREE.Vector3(0, 0.5, 1.5);
+			
+			// Base movement speed (reduced further to match animations)
+			const PLAYER_NORMAL_SPEED = 8; // Reduced from 15
+			// Sprint speed multiplier (slightly increased to maintain good distinction)
+			const PLAYER_SPRINT_MULTIPLIER = 1.8; // Increased from 1.7
+			// Jump height (reduced)
+			const PLAYER_JUMP_FORCE = 10;
+
+			const keyStates = {};
+
+			const vector1 = new THREE.Vector3();
+			const vector2 = new THREE.Vector3();
+			const vector3 = new THREE.Vector3();
+
+			// For camera collision detection
+			const cameraRaycaster = new THREE.Raycaster();
+			const cameraRayDirection = new THREE.Vector3();
+			const idealCameraPosition = new THREE.Vector3();
+			const rayStart = new THREE.Vector3();
+
+			document.addEventListener( 'keydown', ( event ) => {
+
+				keyStates[ event.code ] = true;
+
+			} );
+
+			document.addEventListener( 'keyup', ( event ) => {
+
+				keyStates[ event.code ] = false;
+
+				// Toggle camera view when C is pressed
+				if (event.code === 'KeyC') {
+					thirdPersonView = !thirdPersonView;
+					playerModel.visible = thirdPersonView;
+				}
+
+			} );
+
+			container.addEventListener( 'mousedown', () => {
+
+				document.body.requestPointerLock();
+
+				mouseTime = performance.now();
+
+			} );
+
+			document.addEventListener( 'mouseup', () => {
+
+				if ( document.pointerLockElement !== null ) throwBall();
+
+			} );
+
+			document.body.addEventListener( 'mousemove', ( event ) => {
+
+				if ( document.pointerLockElement === document.body ) {
+					// Always update horizontal rotation (y-axis)
+					camera.rotation.y -= event.movementX / 500;
+					
+					// Apply different vertical rotation limits based on view mode
+					if (thirdPersonView) {
+						// More restricted rotation for third person (±30 degrees)
+						const newRotationX = camera.rotation.x - event.movementY / 500;
+						camera.rotation.x = Math.max(-Math.PI / 6, Math.min(Math.PI / 6, newRotationX));
+					} else {
+						// Full rotation range for first person (±90 degrees)
+						camera.rotation.x -= event.movementY / 500;
+						camera.rotation.x = Math.max(-Math.PI / 2, Math.min(Math.PI / 2, camera.rotation.x));
+					}
+				}
+
+			} );
+
+			window.addEventListener( 'resize', onWindowResize );
+
+			function onWindowResize() {
+
+				camera.aspect = window.innerWidth / window.innerHeight;
+				camera.updateProjectionMatrix();
+
+				renderer.setSize( window.innerWidth, window.innerHeight );
+
+			}
+
+			function throwBall() {
+
+				const sphere = spheres[ sphereIdx ];
+
+				camera.getWorldDirection( playerDirection );
+
+				sphere.collider.center.copy( playerCollider.end ).addScaledVector( playerDirection, playerCollider.radius * 1.5 );
+
+				// throw the ball with more force if we hold the button longer, and if we move forward
+
+				const impulse = 15 + 30 * ( 1 - Math.exp( ( mouseTime - performance.now() ) * 0.001 ) );
+
+				sphere.velocity.copy( playerDirection ).multiplyScalar( impulse );
+				sphere.velocity.addScaledVector( playerVelocity, 2 );
+
+				sphereIdx = ( sphereIdx + 1 ) % spheres.length;
+
+			}
+
+			function playerCollisions() {
+
+				const result = worldOctree.capsuleIntersect( playerCollider );
+
+				playerOnFloor = false;
+
+				if ( result ) {
+
+					playerOnFloor = result.normal.y > 0;
+
+					if ( ! playerOnFloor ) {
+
+						playerVelocity.addScaledVector( result.normal, - result.normal.dot( playerVelocity ) );
+
+					}
+
+					if ( result.depth >= 1e-10 ) {
+
+						playerCollider.translate( result.normal.multiplyScalar( result.depth ) );
+
+					}
+
+				}
+
+			}
+
+			function updatePlayer( deltaTime ) {
+
+				let damping = Math.exp( - 4 * deltaTime ) - 1;
+
+				if ( ! playerOnFloor ) {
+					playerVelocity.y -= GRAVITY * deltaTime;
+					// small air resistance
+					damping *= 0.1;
+					
+					// Update jump state when in the air
+					if (jumpState === 'preparing') {
+						// Stay in preparing state until the jump is executed
+						// The actual transition to 'rising' happens in the controls function
+					} else if (jumpState === 'rising' && playerVelocity.y <= 0) {
+						// Only transition from rising to falling if we were actually rising
+						jumpState = 'falling';
+					}
+				} else {
+					// Handle landing transition
+					if (jumpState === 'falling') {
+						// Only transition to landing if we were actually falling from a jump
+						jumpState = 'landing';
+						jumpStartTime = clock.getElapsedTime();
+					} else if (jumpState === 'landing') {
+						// Check if landing recovery is complete
+						const landTime = clock.getElapsedTime() - jumpStartTime;
+						if (landTime >= JUMP_RECOVERY_TIME) {
+							jumpState = 'none';
+							isJumping = false;
+						}
+					}
+				}
+
+				playerVelocity.addScaledVector( playerVelocity, damping );
+
+				const deltaPosition = playerVelocity.clone().multiplyScalar( deltaTime );
+				playerCollider.translate( deltaPosition );
+
+				playerCollisions();
+
+				// Update player model position and rotation if it exists
+				if (playerModel) {
+					const center = new THREE.Vector3();
+					center.addVectors(playerCollider.start, playerCollider.end).multiplyScalar(0.5);
+					center.add(playerModelOffset); // Apply offset to match capsule position
+					playerModel.position.copy(center);
+					// Make player model face away from camera (180 degrees from camera rotation)
+					playerModel.rotation.y = camera.rotation.y + Math.PI;
+					playerModel.visible = thirdPersonView;
+					
+					// Update animations based on player velocity and jumping state
+					updatePlayerAnimation(deltaTime);
+				}
+
+				// Position camera based on view mode
+				if (thirdPersonView) {
+					// Get camera's exact looking direction (including vertical rotation)
+					camera.getWorldDirection(cameraRayDirection);
+					cameraRayDirection.normalize();
+					
+					// Calculate ideal camera position
+					idealCameraPosition.copy(playerCollider.end);
+					idealCameraPosition.y += cameraOffset.y;
+					
+					// Create a reverse direction vector (from camera to player)
+					cameraRayDirection.negate();
+					
+					// Move camera back in the direction opposite to where we're looking
+					idealCameraPosition.addScaledVector(cameraRayDirection, cameraOffset.z);
+					
+					// Setup raycast from player position to ideal camera position
+					rayStart.copy(playerCollider.end);
+					rayStart.y += cameraOffset.y;
+					
+					// Use octree for collision detection
+					cameraRaycaster.set(rayStart, cameraRayDirection);
+					const rayLength = cameraOffset.z;
+					
+					// Use the octree to check for collisions
+					const result = worldOctree.rayIntersect(cameraRaycaster.ray, rayLength);
+					
+					// Only adjust camera if there's a significant collision
+					// (result exists AND the collision is closer than our desired distance)
+					if (result && result.distance < rayLength * 0.99) {
+						// Collision detected - place camera at intersection point
+						const safeDistance = Math.max(0.4, result.distance * 0.9);
+						camera.position.copy(rayStart).addScaledVector(cameraRayDirection, safeDistance);
+					} else {
+						// No significant collision, use ideal position
+						camera.position.copy(idealCameraPosition);
+					}
+				} else {
+					// First-person camera positioning
+					camera.position.copy(playerCollider.end);
+				}
+
+			}
+
+			// Function to update player animation based on movement
+			function updatePlayerAnimation(deltaTime) {
+				if (!playerMixer || !playerAnimations.idle) return;
+				
+				// Calculate horizontal velocity magnitude (ignore vertical component)
+				const horizontalSpeed = new THREE.Vector2(playerVelocity.x, playerVelocity.z).length();
+				
+				// Threshold for movement detection - use a smaller value for smoother transitions
+				const movementThreshold = 0.05; // Reduced from 0.1
+				
+				// Determine which animation to play based on speed and sprint status
+				let targetAnimation = 'idle';
+				
+				if (horizontalSpeed > movementThreshold) {
+					// Check if moving primarily backward
+					const isMovingBackward = keyStates['KeyS'] && 
+						(!keyStates['KeyW'] || Math.abs(playerVelocity.z) > Math.abs(playerVelocity.x));
+					
+					if (keyStates['ShiftLeft'] || keyStates['ShiftRight']) {
+						targetAnimation = 'run';
+					} else if (isMovingBackward) {
+						targetAnimation = 'walkBack';
+					} else {
+						targetAnimation = 'walk';
+					}
+				}
+				
+				// If the target animation changed, crossfade to it
+				if (targetAnimation !== currentAnimation) {
+					const prevAction = playerAnimations[currentAnimation];
+					const nextAction = playerAnimations[targetAnimation];
+					
+					if (prevAction && nextAction) {
+						// Set weight to ensure smooth transition
+						nextAction.enabled = true;
+						nextAction.setEffectiveTimeScale(targetAnimation === 'walkBack' ? -1 : 1); // Ensure walkBack is reversed
+						nextAction.setEffectiveWeight(1);
+						
+						// Crossfade to the new animation
+						prevAction.crossFadeTo(nextAction, fadeTime, true);
+					}
+					
+					currentAnimation = targetAnimation;
+				}
+				
+				// Adjust animation speed based on movement speed
+				if (currentAnimation === 'walk' || currentAnimation === 'walkBack') {
+					// Calculate a speed factor based on player's velocity and base walk speed
+					const normalizedSpeed = Math.min(1, horizontalSpeed / PLAYER_NORMAL_SPEED);
+					
+					// Fine-tuned animation speed curve for walking
+					// Using a slightly higher base and range for better foot placement
+					const walkSpeedFactor = 0.9 + (normalizedSpeed * 1.3); // Range: 0.9 to 2.2x
+					
+					// Apply animation speed (keeping walkBack negative to maintain reverse direction)
+					if (currentAnimation === 'walk') {
+						playerAnimations.walk.setEffectiveTimeScale(walkSpeedFactor);
+					} else {
+						playerAnimations.walkBack.setEffectiveTimeScale(-walkSpeedFactor); // Keep negative for reverse
+					}
+				} 
+				else if (currentAnimation === 'run') {
+					// Calculate speed factor based on sprint speed
+					const sprintMaxSpeed = PLAYER_NORMAL_SPEED * PLAYER_SPRINT_MULTIPLIER;
+					const normalizedSpeed = Math.min(1, horizontalSpeed / sprintMaxSpeed);
+					
+					// Fine-tuned animation speed curve for running
+					// Using a higher multiplier for more dramatic speed increase
+					const runSpeedFactor = 1.1 + (normalizedSpeed * 1.4); // Range: 1.1 to 2.5x
+					
+					// Apply speed adjustment
+					playerAnimations.run.setEffectiveTimeScale(runSpeedFactor);
+				}
+				else if (currentAnimation === 'idle') {
+					// Reset idle animation to normal speed
+					playerAnimations.idle.setEffectiveTimeScale(1.0);
+				}
+				
+				// Handle jump animation as an additive layer with bell curve pattern
+				if (jumpAnimation) {
+					let targetWeight = 0.0;
+					
+					// Calculate jump animation weight based on current jump state
+					switch (jumpState) {
+						case 'preparing':
+							// Gradually increase from 0 to 1 (bend knees)
+							const prepareProgress = (clock.getElapsedTime() - jumpStartTime) / JUMP_PREPARE_TIME;
+							targetWeight = Math.min(1.0, prepareProgress);
+							break;
+							
+						case 'rising':
+							// Transition from 1 to 0 as player rises (extend legs)
+							// Use vertical velocity as a factor - max at jump start, decreasing as we rise
+							const riseWeight = Math.max(0, 1.0 - (PLAYER_JUMP_FORCE - playerVelocity.y) / PLAYER_JUMP_FORCE);
+							targetWeight = riseWeight;
+							break;
+							
+						case 'falling':
+							// Increase from 0 to 1 as player falls (prepare for landing)
+							// Use normalized negative velocity as factor (more bent as we fall faster)
+							const fallSpeed = Math.min(Math.abs(playerVelocity.y), GRAVITY);
+							targetWeight = Math.min(1.0, fallSpeed / GRAVITY);
+							break;
+							
+						case 'landing':
+							// Decrease from 1 to 0 during recovery phase
+							const landingProgress = (clock.getElapsedTime() - jumpStartTime) / JUMP_RECOVERY_TIME;
+							targetWeight = Math.max(0.0, 1.0 - landingProgress);
+							break;
+							
+						default:
+							targetWeight = 0.0;
+					}
+					
+					// Smoothly blend to target weight
+					const currentWeight = jumpAnimation.getEffectiveWeight();
+					if (Math.abs(targetWeight - currentWeight) > 0.01) {
+						const weightDelta = deltaTime / JUMP_ANIMATION_FADE_TIME;
+						const newWeight = targetWeight > currentWeight 
+							? Math.min(targetWeight, currentWeight + weightDelta)
+							: Math.max(targetWeight, currentWeight - weightDelta);
+							
+						jumpAnimation.setEffectiveWeight(newWeight);
+					} /*else {
+						jumpAnimation.setEffectiveWeight(targetWeight);
+					}*/
+				}
+				
+				// Update the mixer with the time delta
+				playerMixer.update(deltaTime);
+			}
+
+			function playerSphereCollision( sphere ) {
+
+				const center = vector1.addVectors( playerCollider.start, playerCollider.end ).multiplyScalar( 0.5 );
+
+				const sphere_center = sphere.collider.center;
+
+				const r = playerCollider.radius + sphere.collider.radius;
+				const r2 = r * r;
+
+				// approximation: player = 3 spheres
+
+				for ( const point of [ playerCollider.start, playerCollider.end, center ] ) {
+
+					const d2 = point.distanceToSquared( sphere_center );
+
+					if ( d2 < r2 ) {
+
+						const normal = vector1.subVectors( point, sphere_center ).normalize();
+						const v1 = vector2.copy( normal ).multiplyScalar( normal.dot( playerVelocity ) );
+						const v2 = vector3.copy( normal ).multiplyScalar( normal.dot( sphere.velocity ) );
+
+						playerVelocity.add( v2 ).sub( v1 );
+						sphere.velocity.add( v1 ).sub( v2 );
+
+						const d = ( r - Math.sqrt( d2 ) ) / 2;
+						sphere_center.addScaledVector( normal, - d );
+
+					}
+
+				}
+
+			}
+
+			function spheresCollisions() {
+
+				for ( let i = 0, length = spheres.length; i < length; i ++ ) {
+
+					const s1 = spheres[ i ];
+
+					for ( let j = i + 1; j < length; j ++ ) {
+
+						const s2 = spheres[ j ];
+
+						const d2 = s1.collider.center.distanceToSquared( s2.collider.center );
+						const r = s1.collider.radius + s2.collider.radius;
+						const r2 = r * r;
+
+						if ( d2 < r2 ) {
+
+							const normal = vector1.subVectors( s1.collider.center, s2.collider.center ).normalize();
+							const v1 = vector2.copy( normal ).multiplyScalar( normal.dot( s1.velocity ) );
+							const v2 = vector3.copy( normal ).multiplyScalar( normal.dot( s2.velocity ) );
+
+							s1.velocity.add( v2 ).sub( v1 );
+							s2.velocity.add( v1 ).sub( v2 );
+
+							const d = ( r - Math.sqrt( d2 ) ) / 2;
+
+							s1.collider.center.addScaledVector( normal, d );
+							s2.collider.center.addScaledVector( normal, - d );
+
+						}
+
+					}
+
+				}
+
+			}
+
+			function updateSpheres( deltaTime ) {
+
+				spheres.forEach( sphere => {
+
+					sphere.collider.center.addScaledVector( sphere.velocity, deltaTime );
+
+					const result = worldOctree.sphereIntersect( sphere.collider );
+
+					if ( result ) {
+
+						sphere.velocity.addScaledVector( result.normal, - result.normal.dot( sphere.velocity ) * 1.5 );
+						sphere.collider.center.add( result.normal.multiplyScalar( result.depth ) );
+
+					} else {
+
+						sphere.velocity.y -= GRAVITY * deltaTime;
+
+					}
+
+					const damping = Math.exp( - 1.5 * deltaTime ) - 1;
+					sphere.velocity.addScaledVector( sphere.velocity, damping );
+
+					playerSphereCollision( sphere );
+
+				} );
+
+				spheresCollisions();
+
+				for ( const sphere of spheres ) {
+
+					sphere.mesh.position.copy( sphere.collider.center );
+
+				}
+
+			}
+
+			function getForwardVector() {
+
+				camera.getWorldDirection( playerDirection );
+				playerDirection.y = 0;
+				playerDirection.normalize();
+
+				return playerDirection;
+
+			}
+
+			function getSideVector() {
+
+				camera.getWorldDirection( playerDirection );
+				playerDirection.y = 0;
+				playerDirection.normalize();
+				playerDirection.cross( camera.up );
+
+				return playerDirection;
+
+			}
+
+			function controls( deltaTime ) {
+
+				// Check if sprint key is pressed
+				const isSprinting = keyStates['ShiftLeft'] || keyStates['ShiftRight'];
+				
+				// Calculate speed based on sprint status and floor status
+				const speedDelta = deltaTime * (
+					playerOnFloor ? 
+					(isSprinting ? PLAYER_NORMAL_SPEED * PLAYER_SPRINT_MULTIPLIER : PLAYER_NORMAL_SPEED) : 
+					(PLAYER_NORMAL_SPEED * 0.3) // Air control reduced
+				);
+
+				if ( keyStates[ 'KeyW' ] ) {
+
+					playerVelocity.add( getForwardVector().multiplyScalar( speedDelta ) );
+
+				}
+
+				if ( keyStates[ 'KeyS' ] ) {
+
+					playerVelocity.add( getForwardVector().multiplyScalar( - speedDelta ) );
+
+				}
+
+				if ( keyStates[ 'KeyA' ] ) {
+
+					playerVelocity.add( getSideVector().multiplyScalar( - speedDelta ) );
+
+				}
+
+				if ( keyStates[ 'KeyD' ] ) {
+
+					playerVelocity.add( getSideVector().multiplyScalar( speedDelta ) );
+
+				}
+
+				// Update jump cooldown timer
+				if (jumpCooldown > 0) {
+					jumpCooldown -= deltaTime;
+				}
+
+				if ( playerOnFloor ) {
+					// Only allow jump if cooldown has expired and we're not already in a jump state
+					if ( keyStates[ 'Space' ] && jumpCooldown <= 0 && jumpState === 'none' ) {
+						// Reset any lingering jump animation before starting a new jump
+						if (jumpAnimation) {
+							jumpAnimation.setEffectiveWeight(0);
+						}
+						
+						// Start jump preparation phase
+						jumpState = 'preparing';
+						isJumping = true;
+						jumpStartTime = clock.getElapsedTime();
+						
+						// Schedule the actual jump after preparation time
+						setTimeout(() => {
+							if (jumpState === 'preparing' && playerOnFloor) {
+								playerVelocity.y = PLAYER_JUMP_FORCE;
+								// Reset the jump cooldown
+								jumpCooldown = JUMP_COOLDOWN_TIME;
+								// Now we can transition to rising state since the jump is executed
+								jumpState = 'rising';
+							}
+						}, JUMP_PREPARE_TIME * 1000);
+					}
+				}
+
+			}
+
+			const loader = new GLTFLoader().setPath( 'https://threejs.org/examples/models/gltf/' );
+
+			loader.load( 'collision-world.glb', ( gltf ) => {
+
+				scene.add( gltf.scene );
+
+				worldOctree.fromGraphNode( gltf.scene );
+
+				gltf.scene.traverse( child => {
+
+					if ( child.isMesh ) {
+
+						child.castShadow = true;
+						child.receiveShadow = true;
+
+						// Set material to wireframe or make it transparent
+						/*child.material = new THREE.MeshBasicMaterial({
+							wireframe: true, // Set to true for wireframe, false for transparent
+							color: 0xffffff, // White color for wireframe
+							transparent: true,
+							opacity: 0.2
+						});*/ // DEBUG
+
+						if ( child.material.map ) {
+
+							child.material.map.anisotropy = 4;
+
+						}
+
+					}
+
+				} );
+
+				const helper = new OctreeHelper( worldOctree );
+				helper.visible = false;
+				scene.add( helper );
+
+				const gui = new GUI( { width: 200 } );
+				gui.add( { debug: false }, 'debug' )
+					.onChange( function ( value ) {
+
+						helper.visible = value;
+
+					} );
+				
+				// Add camera view toggle to GUI
+				gui.add({ thirdPerson: false }, 'thirdPerson')
+					.onChange(function(value) {
+						thirdPersonView = value;
+						playerModel.visible = value;
+						
+						// Reset camera rotation when switching to third-person
+						if (value) {
+							camera.rotation.x = Math.max(
+								-Math.PI / 6,
+								Math.min(Math.PI / 6, camera.rotation.x)
+							);
+						}
+					})
+					.name('Third Person View (C)');
+					
+				// Add day/night cycle speed control to GUI
+				gui.add(dayCycle, 'cycleDuration', 60, 600, 10)
+					.name('Day Cycle (seconds)')
+					.onChange(function(value) {
+						// Calculate current progress before changing duration
+						const currentProgress = dayCycle.time / dayCycle.cycleDuration;
+						// Update the duration
+						dayCycle.cycleDuration = value;
+						// Adjust time to maintain the same progress in the cycle
+						dayCycle.time = currentProgress * dayCycle.cycleDuration;
+					});
+			
+			} );
+
+			function teleportPlayerIfOob() {
+
+				if ( camera.position.y <= - 25 ) {
+
+					playerCollider.start.set( 0, 0.35, 0 );
+					playerCollider.end.set( 0, 1, 0 );
+					playerCollider.radius = 0.35;
+					camera.position.copy( playerCollider.end );
+					camera.rotation.set( 0, 0, 0 );
+
+				}
+
+			}
+
+
+			function animate() {
+
+				const deltaTime = Math.min( 0.05, clock.getDelta() ) / STEPS_PER_FRAME;
+				
+				// Update day/night cycle
+				updateDayCycle(deltaTime);
+
+				// we look for collisions in substeps to mitigate the risk of
+				// an object traversing another too quickly for detection.
+
+				for ( let i = 0; i < STEPS_PER_FRAME; i ++ ) {
+
+					controls( deltaTime );
+
+					updatePlayer( deltaTime );
+
+					updateSpheres( deltaTime );
+
+					teleportPlayerIfOob();
+
+				}
+
+				renderer.render( scene, camera );
+
+				stats.update();
+
+			}
+
+		</script>
+	</body>
+</html>
